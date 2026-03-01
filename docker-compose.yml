@@ -12,5 +12,6 @@ services:
       - crypto-network-auto
 
 networks:
-  crypto-network:
+  crypto-network-auto:
     driver: bridge
+
