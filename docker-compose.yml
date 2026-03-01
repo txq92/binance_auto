@@ -1,0 +1,16 @@
+services:
+  crypto-detector:
+    build: .
+    container_name: crypto-binance-auto-trade
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./charts:/app/charts
+      - ./logs:/app/logs
+    networks:
+      - crypto-network-auto
+
+networks:
+  crypto-network:
+    driver: bridge

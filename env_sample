@@ -1,0 +1,8 @@
+# ================== BINANCE API ==================
+BINANCE_API_KEY=x
+BINANCE_API_SECRET=Sx
+# ================== TELEGRAM ==================
+TELEGRAM_TOKEN=x
+TELEGRAM_CHAT_ID=x
+# Testnet (Demo) - đặt True để test không mất tiền
+TESTNET_MODE=True
