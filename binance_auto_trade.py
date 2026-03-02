@@ -33,6 +33,7 @@ GLOBAL_LEVERAGE = 25
 TIMEFRAME = "5m"
 MAX_POSITIONS = 20
 TRADING_ENABLED = True
+TRAILING_ENABLED = True
 USE_TESTNET = True
 
 SYMBOL_CONFIGS = {
@@ -166,15 +167,19 @@ def execute_smart_trade(symbol, side, entry_price, low, high):
         return None, "0", 0, 0, str(e)
 
 # ==============================================================================
-# ========== TRAILING SL (GIỮ NGUYÊN LOGIC) ==========
+# ========== TRAILING SL (ĐÃ FIX BUG + THÔNG BÁO CHI TIẾT) ==========
 # ==============================================================================
 
 def manage_trailing_sl():
     """
-    Giữ nguyên logic trailing SL từ binace_co.py gốc:
-    - Khi giá đạt RR1 → dời SL về entry
-    - Khi giá đạt RR2 → dời SL về RR1
+    Trailing SL logic (đã fix bug tính risk):
+    - Dùng TP order để tính ngược original risk → trailing đúng cả 2 bước
+    - Khi giá đạt RR1 → dời SL về entry (Bước 1)
+    - Khi giá đạt RR2 → dời SL về RR1 (Bước 2)
     """
+    if not TRAILING_ENABLED:
+        return
+
     try:
         positions = exchange.fetch_positions()
         if not positions:
@@ -200,41 +205,59 @@ def manage_trailing_sl():
                 continue
             last_close = ohlcv[-2][4]  # close nến trước
 
-            # Tìm SL order hiện tại
+            # Tìm SL & TP order hiện tại
             open_orders = exchange.fetch_open_orders(sym)
             current_sl = 0
             sl_order_id = None
+            current_tp = 0
             for o in open_orders:
                 if o.get('type') in ['stop_market', 'stop'] and o.get('reduceOnly', False):
                     stop_price = o.get('stopPrice') or o.get('triggerPrice') or 0
-                    if float(stop_price) > 0:
+                    if float(stop_price) > 0 and sl_order_id is None:
                         current_sl = float(stop_price)
                         sl_order_id = o['id']
-                        break
+                elif o.get('type') in ['take_profit_market', 'take_profit'] and o.get('reduceOnly', False):
+                    tp_price = o.get('stopPrice') or o.get('triggerPrice') or 0
+                    if float(tp_price) > 0:
+                        current_tp = float(tp_price)
 
             if not sl_order_id or current_sl == 0:
                 continue
 
-            risk = abs(entry_px - current_sl)
-            if pos_side == 'long':
-                rr1 = entry_px + risk
-                rr2 = entry_px + risk * 2
+            # === FIX: Tính original risk từ TP (R:R 1:2 → risk = |TP - entry| / 2) ===
+            if current_tp > 0:
+                original_risk = abs(current_tp - entry_px) / 2.0
             else:
-                rr1 = entry_px - risk
-                rr2 = entry_px - risk * 2
+                # Fallback: dùng current_sl nếu không tìm thấy TP
+                original_risk = abs(entry_px - current_sl)
 
-            # Logic trailing - GIỮ NGUYÊN
+            if original_risk == 0:
+                continue
+
+            if pos_side == 'long':
+                rr1 = entry_px + original_risk
+                rr2 = entry_px + original_risk * 2
+            else:
+                rr1 = entry_px - original_risk
+                rr2 = entry_px - original_risk * 2
+
+            # Logic trailing
             new_sl = None
+            trail_step = ""
             if pos_side == 'long':
                 if last_close >= rr2 and current_sl < rr1:
                     new_sl = float(exchange.price_to_precision(sym, rr1))
+                    trail_step = "Bước 2"
                 elif last_close >= rr1 and current_sl < entry_px:
                     new_sl = float(exchange.price_to_precision(sym, entry_px))
+                    trail_step = "Bước 1"
             else:
                 if last_close <= rr2 and current_sl > rr1:
                     new_sl = float(exchange.price_to_precision(sym, rr1))
+                    trail_step = "Bước 2"
                 elif last_close <= rr1 and current_sl > entry_px:
                     new_sl = float(exchange.price_to_precision(sym, entry_px))
+                    trail_step = "Bước 1"
 
             if new_sl:
                 try:
@@ -243,15 +266,92 @@ def manage_trailing_sl():
                     sl_side = 'sell' if pos_side == 'long' else 'buy'
                     exchange.create_order(sym, 'stop_market', sl_side, contracts,
                                           params={'stopPrice': new_sl, 'reduceOnly': True})
-                    trail_msg = f"🛡️ Trail SL {sym} → {new_sl}"
-                    print(trail_msg)
-                    bot.send_message(CHAT_ID, trail_msg)
-                    logging.info(trail_msg)
+
+                    # Thông báo chi tiết
+                    side_text = pos_side.upper()
+                    if trail_step == "Bước 1":
+                        step_desc = "Giá đạt RR1 → Dời SL về Entry (hòa vốn)"
+                    else:
+                        step_desc = "Giá đạt RR2 → Dời SL về RR1 (khóa lời)"
+
+                    trail_msg = f"""🛡️ **TRAILING SL** ({trail_step})
+📍 {sym} | {side_text}
+📊 {step_desc}
+💰 Entry: {entry_px:.6f}
+🔄 SL cũ: {current_sl:.6f} → SL mới: **{new_sl:.6f}**
+📈 Giá hiện tại: {last_close:.6f}"""
+                    print(f"🛡️ Trail SL {sym} ({trail_step}) → {new_sl}")
+                    bot.send_message(CHAT_ID, trail_msg, parse_mode='Markdown')
+                    logging.info(f"TRAIL {trail_step} {sym} {side_text} | SL: {current_sl} → {new_sl}")
                 except Exception as e:
                     print(f"⚠️ Trail SL Error {sym}: {e}")
     except Exception as e:
         print(f"⚠️ Trailing SL Error: {e}")
         logging.error(f"Trailing SL Error: {e}")
+
+# ==============================================================================
+# ========== DỌN DẸP LỆNH MỒ CÔI (SL/TP CÒN SÓT) ==========
+# ==============================================================================
+
+def cleanup_orphan_orders():
+    """
+    Khi SL trigger → TP vẫn còn mở (và ngược lại).
+    Hàm này tìm các symbol không còn vị thế nhưng vẫn có lệnh SL/TP mở,
+    rồi hủy chúng để tránh gây rối cho lệnh mới.
+    """
+    try:
+        # Lấy tất cả positions
+        positions = exchange.fetch_positions()
+        # Tìm các symbol ĐANG có vị thế
+        active_symbols = set()
+        for p in positions:
+            if float(p.get('contracts', 0) or 0) != 0:
+                active_symbols.add(p.get('symbol', ''))
+
+        # Kiểm tra từng pair, nếu không có vị thế mà vẫn có lệnh → hủy
+        for sym in PAIRS:
+            if sym in active_symbols:
+                continue  # Có vị thế → không động vào
+
+            try:
+                open_orders = exchange.fetch_open_orders(sym)
+                if not open_orders:
+                    continue
+
+                # Lọc chỉ các lệnh SL/TP (reduceOnly)
+                orphan_orders = [
+                    o for o in open_orders
+                    if o.get('reduceOnly', False) and
+                    o.get('type') in ['stop_market', 'stop', 'take_profit_market', 'take_profit']
+                ]
+
+                if not orphan_orders:
+                    continue
+
+                # Hủy tất cả lệnh mồ côi
+                cancelled_count = 0
+                for o in orphan_orders:
+                    try:
+                        exchange.cancel_order(o['id'], sym)
+                        cancelled_count += 1
+                    except Exception as e:
+                        print(f"⚠️ Không hủy được lệnh {o['id']} {sym}: {e}")
+
+                if cancelled_count > 0:
+                    msg = f"""🧹 **DỌN LỆNH MỒ CÔI**
+📍 {sym}
+❌ Đã hủy {cancelled_count} lệnh SL/TP còn sót
+💡 Vị thế đã đóng (SL/TP đã trigger)"""
+                    print(f"🧹 Cleanup {sym}: hủy {cancelled_count} lệnh mồ côi")
+                    bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
+                    logging.info(f"CLEANUP {sym}: cancelled {cancelled_count} orphan orders")
+
+            except Exception as e:
+                print(f"⚠️ Cleanup error {sym}: {e}")
+
+    except Exception as e:
+        print(f"⚠️ Cleanup orphan orders error: {e}")
+        logging.error(f"Cleanup orphan orders error: {e}")
 
 # ==============================================================================
 # ========== QUÉT THỊ TRƯỜNG (GIỮ NGUYÊN LOGIC EMA20 + WICK) ==========
@@ -375,7 +475,9 @@ Pairs: {len(PAIRS)} cặp""", parse_mode='Markdown')
                 if now.minute % 5 == 0 and now.minute != last_processed_minute:
                     time.sleep(5)  # Chờ nến đóng xong
                     run_market_scan()
-                    manage_trailing_sl()
+                    if TRAILING_ENABLED:
+                        manage_trailing_sl()
+                    cleanup_orphan_orders()
                     last_processed_minute = now.minute
         except Exception as e:
             print(f"Lỗi vòng lặp: {e}")
@@ -402,7 +504,8 @@ def status(message):
 ⚡ Leverage: {GLOBAL_LEVERAGE}x
 💰 Margin/lệnh: {TRADE_AMOUNT_USDT} USDT → Position: {TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT
 💵 Số dư: {usdt_free:.2f} USDT (khả dụng) / {usdt_total:.2f} USDT (tổng)
-🤖 Auto Trade: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}"""
+🤖 Auto Trade: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}
+🛡️ Trailing SL: {'🟢 ON' if TRAILING_ENABLED else '🔴 OFF'}"""
         bot.reply_to(message, msg, parse_mode='Markdown')
 
 @bot.message_handler(commands=['trade'])
@@ -610,6 +713,27 @@ def show_ip(message):
 🌍 External IP: `{ext_ip}`"""
     bot.reply_to(message, msg, parse_mode='Markdown')
 
+@bot.message_handler(commands=['slmove'])
+def slmove_control(message):
+    if message.chat.id != CHAT_ID:
+        return
+    global TRAILING_ENABLED
+    text = message.text.lower()
+    if 'on' in text:
+        TRAILING_ENABLED = True
+        bot.reply_to(message, "✅ TRAILING SL đã BẬT\n🛡️ Bot sẽ tự động dời SL khi giá đạt RR1/RR2")
+    elif 'off' in text:
+        TRAILING_ENABLED = False
+        bot.reply_to(message, "⛔ TRAILING SL đã TẮT\n⚠️ SL sẽ giữ nguyên vị trí ban đầu")
+    else:
+        status = '🟢 ON' if TRAILING_ENABLED else '🔴 OFF'
+        bot.reply_to(message, f"""🛡️ **Trailing SL: {status}**
+
+Bước 1: Giá đạt RR1 → Dời SL về Entry (hòa vốn)
+Bước 2: Giá đạt RR2 → Dời SL về RR1 (khóa lời)
+
+Dùng: `/slmove on` hoặc `/slmove off`""", parse_mode='Markdown')
+
 @bot.message_handler(commands=['help'])
 def help_command(message):
     if message.chat.id == CHAT_ID:
@@ -618,6 +742,8 @@ def help_command(message):
 /status     - Trạng thái bot
 /trade on   - Bật tự động trade
 /trade off  - Tắt tự động trade
+/slmove on  - Bật trailing SL
+/slmove off - Tắt trailing SL
 /amo 20     - Set vốn (USDT)
 /leve 10    - Set leverage
 /pos        - Xem vị thế đang mở
