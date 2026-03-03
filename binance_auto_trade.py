@@ -29,16 +29,16 @@ CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
 
 # ===== Trading Config =====
 TRADE_AMOUNT_USDT = 10.0
-GLOBAL_LEVERAGE = 25
+GLOBAL_LEVERAGE = 10
 TIMEFRAME = "5m"
-MAX_POSITIONS = 20
+MAX_POSITIONS = 3
 TRADING_ENABLED = True
 TRAILING_ENABLED = True
-USE_TESTNET = True
+USE_TESTNET = os.environ.get("TESTNET_MODE", "True").strip().lower() == "true"
 
 SYMBOL_CONFIGS = {
-    "BTC/USDT":   {"X": 0.15, "Y": 0.05, "Active": True},
-    "ETH/USDT":   {"X": 0.3,  "Y": 0.05, "Active": True},
+    "BTC/USDT":   {"X": 0.15, "Y": 0.05, "Active": False},
+    "ETH/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
     "SOL/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
     "BNB/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
     "XRP/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
@@ -46,9 +46,15 @@ SYMBOL_CONFIGS = {
     "ADA/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
     "AVAX/USDT":  {"X": 0.35, "Y": 0.05, "Active": True},
     "DOT/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
-    "LINK/USDT":  {"X": 0.35, "Y": 0.05, "Active": True},
+    "LINK/USDT":  {"X": 0.35, "Y": 0.03, "Active": True},
     "NEAR/USDT":  {"X": 0.35, "Y": 0.05, "Active": True},
-    "FIL/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
+    "RLC/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
+    "ARB/USDT":   {"X": 0.35, "Y": 0.03, "Active": True},
+    "OP/USDT":    {"X": 0.35, "Y": 0.03, "Active": True},
+    "INJ/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
+    "APT/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
+    "SUI/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
+    "SEI/USDT":   {"X": 0.35, "Y": 0.05, "Active": True},
 }
 
 PAIRS = [sym for sym, cfg in SYMBOL_CONFIGS.items() if cfg.get("Active")]
@@ -734,6 +740,25 @@ Bước 2: Giá đạt RR2 → Dời SL về RR1 (khóa lời)
 
 Dùng: `/slmove on` hoặc `/slmove off`""", parse_mode='Markdown')
 
+@bot.message_handler(commands=['limit'])
+def set_limit(message):
+    if message.chat.id != CHAT_ID:
+        return
+    global MAX_POSITIONS
+    parts = message.text.strip().split()
+    if len(parts) >= 2:
+        try:
+            new_val = int(parts[1])
+            if new_val < 1:
+                bot.reply_to(message, "❌ Giá trị phải >= 1")
+                return
+            MAX_POSITIONS = new_val
+            bot.reply_to(message, f"✅ Đã set giới hạn vị thế = **{MAX_POSITIONS}**", parse_mode='Markdown')
+        except ValueError:
+            bot.reply_to(message, "❌ Sai định dạng. VD: /limit 5")
+    else:
+        bot.reply_to(message, f"📊 Giới hạn vị thế hiện tại: **{MAX_POSITIONS}**\n\nĐể thay đổi: `/limit 5`", parse_mode='Markdown')
+
 @bot.message_handler(commands=['help'])
 def help_command(message):
     if message.chat.id == CHAT_ID:
@@ -746,6 +771,7 @@ def help_command(message):
 /slmove off - Tắt trailing SL
 /amo 20     - Set vốn (USDT)
 /leve 10    - Set leverage
+/limit 5    - Set giới hạn vị thế tối đa (mặc định: 3)
 /pos        - Xem vị thế đang mở
 /closed     - Xem lệnh đã đóng + PNL 24h
 /stats      - Thống kê 24 giờ
