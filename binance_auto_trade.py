@@ -112,10 +112,10 @@ last_candle_ts = {symbol: 0 for symbol in PAIRS}
 # ========== LOGIC VÀO LỆNH & STOP LOSS (GIỮ NGUYÊN NGHIỆP VỤ) ==========
 # ==============================================================================
 
-def execute_smart_trade(symbol, side, entry_price, low, high):
+def execute_smart_trade(symbol, side, entry_price, low, high, atr=0):
     """
-    Giữ nguyên logic tính toán SL/TP từ binace_co.py gốc:
-    - SL = Low ± 0.2% (offset)
+    SL dựa trên ATR(14):
+    - SL = Low/High ± 0.5 * ATR
     - TP = R:R 1:2 từ SL
     """
     try:
@@ -129,23 +129,24 @@ def execute_smart_trade(symbol, side, entry_price, low, high):
         total_notional_usdt = TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE
         quantity = float(exchange.amount_to_precision(symbol, total_notional_usdt / entry_price))
 
-        # LOGIC STOP LOSS (±0.2%) - GIỮ NGUYÊN
+        # LOGIC STOP LOSS: ATR-based (Low/High ± 0.5 * ATR)
+        atr_offset = atr * 0.5 if atr > 0 else entry_price * 0.002
         if side == "buy":
-            sl_raw = low * (1 - 0.002)
+            sl_raw = low - atr_offset
         else:
-            sl_raw = high * (1 + 0.002)
+            sl_raw = high + atr_offset
         sl = float(exchange.price_to_precision(symbol, sl_raw))
 
-        # Tính TP (R:R 1:2) - GIỮ NGUYÊN
-        risk = abs(entry_price - sl)
-        if side == "buy":
-            tp = float(exchange.price_to_precision(symbol, entry_price + (risk * 2)))
-        else:
-            tp = float(exchange.price_to_precision(symbol, entry_price - (risk * 2)))
-
-        # Đặt lệnh Market
+        # Đặt lệnh Market trước để biết actual_entry
         order = exchange.create_market_order(symbol, side, quantity)
-        actual_entry = order.get('price') or exchange.fetch_ticker(symbol)['last']
+        actual_entry = float(order.get('price') or exchange.fetch_ticker(symbol)['last'])
+
+        # Tính TP (R:R 1:2) từ actual_entry để đảm bảo đúng tỷ lệ
+        risk = abs(actual_entry - sl)
+        if side == "buy":
+            tp = float(exchange.price_to_precision(symbol, actual_entry + (risk * 2)))
+        else:
+            tp = float(exchange.price_to_precision(symbol, actual_entry - (risk * 2)))
 
         # Đặt SL & TP
         sl_side = 'sell' if side == 'buy' else 'buy'
@@ -368,7 +369,7 @@ def run_market_scan():
         if not cfg.get("Active"):
             continue
         try:
-            ohlcv = exchange.fetch_ohlcv(sym, TIMEFRAME, limit=50)
+            ohlcv = exchange.fetch_ohlcv(sym, TIMEFRAME, limit=60)
             if not ohlcv:
                 continue
 
@@ -376,6 +377,11 @@ def run_market_scan():
             df[['o', 'h', 'l', 'c']] = df[['o', 'h', 'l', 'c']].astype(float)
             df = df.sort_values('ts').reset_index(drop=True)
             df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
+            df['ema50'] = df['c'].ewm(span=50, adjust=False).mean()
+            df['vol_ma20'] = df['v'].rolling(window=20).mean()
+            df['atr'] = pd.concat([df['h'] - df['l'],
+                                   (df['h'] - df['c'].shift()).abs(),
+                                   (df['l'] - df['c'].shift()).abs()], axis=1).max(axis=1).rolling(window=14).mean()
 
             s = df.iloc[-2]  # Nến đã đóng gần nhất
             ts = int(s['ts'])
@@ -385,16 +391,25 @@ def run_market_scan():
                 continue
             last_candle_ts[sym] = ts
 
-            # === LOGIC TÍN HIỆU - GIỮ NGUYÊN ===
+            # === LOGIC TÍN HIỆU (EMA50 trend filter + Volume filter) ===
             max_oc = max(s['o'], s['c'])
             min_oc = min(s['o'], s['c'])
             up_wick = ((s['h'] - max_oc) / max_oc) * 100
             lo_wick = ((min_oc - s['l']) / min_oc) * 100
 
+            # Trend filter: EMA20 vs EMA50
+            ema20_val = s['ema20']
+            ema50_val = s['ema50']
+            uptrend = ema20_val > ema50_val
+            downtrend = ema20_val < ema50_val
+
+            # Volume filter: volume nến tín hiệu >= 1.2x trung bình 20 nến
+            vol_ok = s['v'] >= s['vol_ma20'] * 1.2 if s['vol_ma20'] > 0 else False
+
             side = None
-            if (s['c'] > s['o']) and (s['c'] > s['ema20']) and (lo_wick >= cfg['X']) and (up_wick <= cfg['Y']):
+            if (s['c'] > s['o']) and (s['c'] > ema20_val) and uptrend and vol_ok and (lo_wick >= cfg['X']) and (up_wick <= cfg['Y']):
                 side = "buy"
-            elif (s['c'] < s['o']) and (s['c'] < s['ema20']) and (up_wick >= cfg['X']) and (lo_wick <= cfg['Y']):
+            elif (s['c'] < s['o']) and (s['c'] < ema20_val) and downtrend and vol_ok and (up_wick >= cfg['X']) and (lo_wick <= cfg['Y']):
                 side = "sell"
 
             if not side:
@@ -428,7 +443,7 @@ Position Size: **{total_vol} USDT** (Leverage {GLOBAL_LEVERAGE}x)"""
             bot.send_message(CHAT_ID, msg_signal, parse_mode='Markdown')
 
             if TRADING_ENABLED:
-                res, sz, sl, tp, err = execute_smart_trade(sym, side, s['c'], s['l'], s['h'])
+                res, sz, sl, tp, err = execute_smart_trade(sym, side, s['c'], s['l'], s['h'], s['atr'])
 
                 if res and not err:
                     actual_entry = res.get('price') or s['c']
@@ -441,7 +456,7 @@ Position Size: **{total_vol} USDT** (Leverage {GLOBAL_LEVERAGE}x)"""
                         tp_pct = (actual_entry - tp) / actual_entry * 100
                     rr = round(tp_pct / sl_pct, 1) if sl_pct > 0 else 2.0
 
-                    msg = f"""✅ **VÀO LỆNH THÀNH CÔNG** (SL ±0.2% Offset)
+                    msg = f"""✅ **VÀO LỆNH THÀNH CÔNG** (SL ATR-based)
 Pair: {sym}
 Side: {side_text}
 Position Size: **{total_vol} USDT** (Leverage {GLOBAL_LEVERAGE}x)
@@ -470,7 +485,7 @@ def main_loop():
     logging.info("Bot trading loop started")
     bot.send_message(CHAT_ID, f"""🤖 **EMA Wick Bot (Binance)**
 Max Positions: {MAX_POSITIONS} | Leverage: {GLOBAL_LEVERAGE}x | Position Size: {TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT
-SL Mode: ±0.2% Offset + Trailing SL
+SL Mode: ATR-based + Trailing SL
 Auto Trade: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}
 Pairs: {len(PAIRS)} cặp""", parse_mode='Markdown')
 
